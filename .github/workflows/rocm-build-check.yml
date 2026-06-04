@@ -1,0 +1,72 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Short-term compile-only ROCm CI per @edgargabriel's ask on #1647:
+# "What we could easily do is have initially a compilation only CI,
+# similarly to what we do in UCC or UCX. This is a short-term solution
+# that can be deployed very fast."
+#
+# This consumes the Dockerfile.rocm + the `ghcr.io/ai-dynamo/nixl-rocm`
+# pre-built image (UCX-with-rocm + apt deps + tomlplusplus). It only
+# rebuilds NIXL itself + nixlbench against the PR's source — much
+# faster than rebuilding the whole stack each time, and it isolates
+# regression risk to nixl/nixlbench code rather than infra.
+#
+# Future (medium-term): private GitHub runner with real MI300X/MI355X
+# GPUs + ionic NICs for end-to-end transfer validation, per the same
+# thread.
+
+name: rocm-build-check
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'benchmark/nixlbench/**'
+      - 'meson.build'
+      - 'meson_options.txt'
+      - 'benchmark/nixlbench/contrib/Dockerfile.rocm'
+      - '.github/workflows/rocm-build-check.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ROCm compile-only (host)
+    runs-on: ubuntu-latest
+    # Skip on Draft PRs — the container image is the prerequisite for the job
+    # to even start, and we don't want noisy red checks while iterating on a
+    # Draft (e.g. before the ghcr.io image has been published for the first
+    # time, or while the image namespace is in flux).
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    container:
+      image: ghcr.io/ai-dynamo/nixl-rocm:base-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: meson setup nixl (wheel_variant=rocm)
+        run: |
+          meson setup build \
+            -Ducx_path=/usr/local/ucx \
+            -Dwheel_variant=rocm \
+            --werror
+
+      - name: ninja install nixl
+        run: ninja -C build install
+
+      - name: meson setup nixlbench (use_rocm=true)
+        run: |
+          cd benchmark/nixlbench
+          meson setup build \
+            -Duse_rocm=true \
+            -Drocm_path=/opt/rocm \
+            -Dnixl_path=/usr/local \
+            --werror
+
+      - name: ninja install nixlbench
+        run: cd benchmark/nixlbench && ninja -C build install
+
+      - name: verify symbols
+        run: |
+          /usr/local/nixlbench/bin/nixlbench --help | head -20
+          ldd /usr/local/nixlbench/bin/nixlbench | grep -iE 'hip|rocm|ucx'

@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# `nixl_rocm` wheel generation workflow, per @tvegas1's ask on #1647:
+# "add nixl_rocm to release?"
+#
+# Uses the `wheel_variant=rocm` Meson option (added by #1642) to emit
+# wheels named `nixl_rocm` instead of `nixl_cu12` / `nixl_cu13`. Built
+# inside the `ghcr.io/ai-dynamo/nixl-rocm:base-latest` image, which has
+# UCX-with-rocm pre-built (the heavy part of the toolchain).
+#
+# Triggered on tagged releases. Output wheel(s) are uploaded as a
+# release asset; downstream `pip install nixl_rocm` resolves to this
+# once the workflow is wired into the meta-release script.
+
+name: wheel-rocm
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref to build (default: current branch)'
+        required: false
+        type: string
+
+jobs:
+  build-wheel:
+    name: Build nixl_rocm wheel
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ai-dynamo/nixl-rocm:base-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: meson setup with wheel_variant=rocm
+        run: |
+          meson setup build \
+            -Ducx_path=/usr/local/ucx \
+            -Dwheel_variant=rocm
+
+      - name: ninja install (populates wheel staging dir)
+        run: ninja -C build install
+
+      - name: Build wheel
+        run: |
+          # NIXL's existing wheel build path picks up cuda_wheel_dir
+          # (set to 'nixl_rocm' by wheel_variant) and emits the wheel
+          # under dist/.
+          python3 -m pip install build
+          python3 -m build --wheel --outdir dist
+          ls -la dist/
+
+      - name: Upload wheel as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nixl_rocm-wheel
+          path: dist/nixl_rocm-*.whl
+          if-no-files-found: error
+
+      - name: Attach wheel to release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/nixl_rocm-*.whl

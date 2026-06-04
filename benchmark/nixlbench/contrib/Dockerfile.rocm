@@ -1,0 +1,196 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Dockerfile for building nixl + nixlbench against AMD ROCm/HIP.
+#
+# Validated on MI300X (gfx942) and MI355X (gfx950) with AMD Pensando AINIC
+# (ionic) RoCE NICs. Builds against ai-dynamo/nixl#1647 (nixlbench
+# `-Duse_rocm=true`) and emits a `nixl_rocm` wheel via the `wheel_variant`
+# option added in #1642.
+#
+# Build:
+#   docker build -f benchmark/nixlbench/contrib/Dockerfile.rocm \
+#                -t nixl-rocm:latest .
+#
+# Run (requires ROCm KFD + ionic ib_uverbs + /boot bind-mount for the
+# kernel-feature gate that UCX's rocm-ipc path probes):
+#   docker run --rm -it --device=/dev/kfd --device=/dev/dri \
+#              --device=/dev/infiniband --network=host \
+#              --cap-add=IPC_LOCK --ipc=host \
+#              -v /boot:/boot:ro \
+#              -e UCX_ROCM_COPY_DMABUF=yes \
+#              -e UCX_ROCM_IPC_MIN_ZCOPY=0 \
+#              nixl-rocm:latest
+#
+# The /boot mount + UCX_ROCM_COPY_DMABUF=yes env var unlock UCX's dmabuf-based
+# VRAM memory registration on Pensando AINIC NICs. UCX's
+# uct_rocm_base_is_dmabuf_supported() reads /boot/config-$(uname -r) to
+# verify CONFIG_PCI_P2PDMA=y + CONFIG_DMABUF_MOVE_NOTIFY=y; without /boot
+# mounted the check silently returns false and dmabuf is disabled. The
+# env vars opt in to the dmabuf code path in the rocm_copy / rocm_ipc MDs
+# (default is "no" upstream). Without all three, VRAM registration falls
+# back to ibv_reg_mr on raw VRAM pointers, which the ionic kernel driver
+# rejects with EINVAL.
+
+ARG BASE_IMAGE="docker.io/rocm/dev-ubuntu-24.04"
+ARG BASE_IMAGE_TAG="7.1.1-complete"
+ARG DEFAULT_PYTHON_VERSION="3.12"
+ARG UCX_VERSION="v1.21.x"
+ARG WHEEL_VARIANT="rocm"
+
+# ---- Stage 1: base + apt deps + python tools ----
+FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} AS base
+
+ARG DEFAULT_PYTHON_VERSION
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+      autoconf \
+      automake \
+      build-essential \
+      ca-certificates \
+      clang \
+      cmake \
+      curl \
+      file \
+      git \
+      libasio-dev \
+      libgflags-dev \
+      libnuma-dev \
+      libpci-dev \
+      libtool \
+      libtool-bin \
+      libudev-dev \
+      ninja-build \
+      pkg-config \
+      python${DEFAULT_PYTHON_VERSION} \
+      python${DEFAULT_PYTHON_VERSION}-dev \
+      python${DEFAULT_PYTHON_VERSION}-venv \
+      python3-pip \
+      rdma-core \
+      ibverbs-providers \
+      libibverbs-dev \
+      libibumad-dev \
+      librdmacm-dev \
+      sudo && \
+    rm -rf /var/lib/apt/lists/*
+
+# tomlplusplus from master — bypasses the gcc preprocessor bug in tagged 3.4.0
+# where `__has_attribute(__noinline__)` fails to expand (the meson wrap pinned
+# in NIXL pulls 3.4.0). v3.4.0 is still the latest tag; the fix lives only on
+# master. Installing system-wide via cmake means meson's
+# `dependency('tomlplusplus')` resolves to this before the subproject fallback.
+RUN git clone --depth=1 https://github.com/marzer/tomlplusplus.git /tmp/tomlplusplus && \
+    cd /tmp/tomlplusplus && \
+    cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_TESTING=OFF -DBUILD_EXAMPLES=OFF && \
+    cmake --install build && \
+    rm -rf /tmp/tomlplusplus && \
+    # gcc 13 + glibc cdefs.h pre-expands `__noinline__` before __has_attribute
+    # sees it, breaking the `TOML_HAS_ATTR(__noinline__)` preprocessor check.
+    # `noinline` is the same attribute without the reserved underscores.
+    sed -i 's/TOML_HAS_ATTR(__noinline__)/TOML_HAS_ATTR(noinline)/g' \
+      /usr/local/include/toml++/impl/preprocessor.hpp
+
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+      meson==1.5.1 \
+      ninja \
+      pybind11 \
+      tomlkit \
+      typing_extensions
+
+# ---- Stage 2: UCX with ROCm + verbs ----
+# Built from source because Ubuntu's rdma-core ships UCX without --with-rocm.
+# Required for the nixl UCX backend to see HIP device memory as a registrable
+# memory type (rocm_copy, rocm_ipc transports + the rocm MD that owns
+# hsa_amd_pointer_info-based memory-type detection).
+FROM base AS ucx-build
+
+ARG UCX_VERSION
+
+RUN cd /tmp && \
+    git clone --depth=1 --branch ${UCX_VERSION} https://github.com/openucx/ucx.git && \
+    cd ucx && \
+    ./autogen.sh && \
+    ./contrib/configure-release-mt \
+      --prefix=/usr/local/ucx \
+      --enable-shared \
+      --disable-static \
+      --disable-doxygen-doc \
+      --enable-optimizations \
+      --enable-cma \
+      --enable-devel-headers \
+      --with-rocm=/opt/rocm \
+      --with-verbs && \
+    make -j"$(nproc)" && \
+    make -j"$(nproc)" install-strip && \
+    cd / && rm -rf /tmp/ucx
+
+# ---- Stage 3: nixl + nixlbench build ----
+FROM ucx-build AS nixl-build
+
+ARG WHEEL_VARIANT
+
+ENV PATH=/usr/local/ucx/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/ucx/lib:/opt/rocm/lib:${LD_LIBRARY_PATH} \
+    PKG_CONFIG_PATH=/usr/local/ucx/lib/pkgconfig:${PKG_CONFIG_PATH}
+
+RUN ldconfig
+
+WORKDIR /workspace
+COPY . /workspace/nixl
+
+# NIXL — emits a `nixl_${WHEEL_VARIANT}` wheel via #1642's wheel_variant option.
+# Install under /usr/local so the multi-stage `COPY --from=nixl-build /usr/local
+# ...` picks it up (NIXL's default prefix is /opt/nvidia/nvda_nixl).
+RUN cd /workspace/nixl && \
+    meson setup build \
+      -Ducx_path=/usr/local/ucx \
+      -Dwheel_variant=${WHEEL_VARIANT} \
+      --prefix=/usr/local && \
+    ninja -C build install && \
+    ldconfig
+
+# nixlbench — uses #1647's use_rocm option. Picks ROCm/HIP code paths
+# automatically via per-target rocm_dep injection.
+RUN cd /workspace/nixl/benchmark/nixlbench && \
+    meson setup build \
+      -Duse_rocm=true \
+      -Drocm_path=/opt/rocm \
+      -Dnixl_path=/usr/local && \
+    ninja -C build install
+
+# ---- Stage 4: runtime image (smaller) ----
+FROM base AS runtime
+
+COPY --from=nixl-build /usr/local/ucx /usr/local/ucx
+COPY --from=nixl-build /usr/local/include /usr/local/include
+COPY --from=nixl-build /usr/local/lib /usr/local/lib
+COPY --from=nixl-build /usr/local/bin /usr/local/bin
+COPY --from=nixl-build /usr/local/nixlbench /usr/local/nixlbench
+
+ENV PATH=/usr/local/nixlbench/bin:/usr/local/ucx/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/lib:/usr/local/ucx/lib:/opt/rocm/lib:${LD_LIBRARY_PATH}
+
+RUN ldconfig
+
+# Runtime knobs for AMD Pensando AINIC; see top-of-file comment.
+ENV UCX_ROCM_COPY_DMABUF=yes \
+    UCX_ROCM_IPC_MIN_ZCOPY=0
+
+WORKDIR /workspace
+
+CMD ["/bin/bash"]
