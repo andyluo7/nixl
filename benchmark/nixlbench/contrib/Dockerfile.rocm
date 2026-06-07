@@ -69,14 +69,21 @@ RUN apt-get update -y && \
       file \
       git \
       libasio-dev \
+      libcpprest-dev \
       libgflags-dev \
+      libgrpc++-dev \
+      libgrpc-dev \
       libnuma-dev \
       libpci-dev \
+      libprotobuf-dev \
+      libssl-dev \
       libtool \
       libtool-bin \
       libudev-dev \
       ninja-build \
       pkg-config \
+      protobuf-compiler \
+      protobuf-compiler-grpc \
       python${DEFAULT_PYTHON_VERSION} \
       python${DEFAULT_PYTHON_VERSION}-dev \
       python${DEFAULT_PYTHON_VERSION}-venv \
@@ -104,6 +111,18 @@ RUN git clone --depth=1 https://github.com/marzer/tomlplusplus.git /tmp/tomlplus
     # `noinline` is the same attribute without the reserved underscores.
     sed -i 's/TOML_HAS_ATTR(__noinline__)/TOML_HAS_ATTR(noinline)/g' \
       /usr/local/include/toml++/impl/preprocessor.hpp
+
+# etcd-cpp-api — needed so nixlbench can use the ETCD runtime (>2 processes).
+# ASIO runtime is hard-capped at 2 processes; with ETCD we can spawn 8+
+# parallel processes to split MR registration across each process's separate
+# RLIMIT_MEMLOCK (4 GB cap per process on AAC1).
+RUN git clone --depth=1 https://github.com/etcd-cpp-apiv3/etcd-cpp-apiv3.git /tmp/etcd-cpp-api && \
+    cd /tmp/etcd-cpp-api && \
+    cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_ETCD_TESTS=OFF -DBUILD_ETCD_CORE_ONLY=ON && \
+    cmake --build build -j$(nproc) && \
+    cmake --install build && \
+    ldconfig && \
+    rm -rf /tmp/etcd-cpp-api
 
 RUN python3 -m pip install --no-cache-dir --break-system-packages \
       meson==1.5.1 \
