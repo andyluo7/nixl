@@ -96,6 +96,30 @@ RUN apt-get update -y && \
       sudo && \
     rm -rf /var/lib/apt/lists/*
 
+# Newer Abseil — AMD's rocm/dev-ubuntu-24.04 ships libabsl-dev 20220623
+# which lacks `absl_log`; NIXL's meson errors out and refuses to use the
+# subproject fallback when system Abseil is partially present. Install
+# Abseil LTS from source to /usr/local so meson finds the newer headers/
+# pkg-config files first via PKG_CONFIG_PATH.
+RUN git clone --depth=1 --branch 20240722.1 https://github.com/abseil/abseil-cpp.git /tmp/abseil && \
+    cd /tmp/abseil && \
+    cmake -S . -B build \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+      -DABSL_BUILD_TESTING=OFF \
+      -DABSL_PROPAGATE_CXX_STD=ON \
+      -DBUILD_SHARED_LIBS=ON \
+      -DCMAKE_CXX_STANDARD=17 && \
+    cmake --build build -j$(nproc) && \
+    cmake --install build && \
+    ldconfig && \
+    rm -rf /tmp/abseil
+
+# Make pkg-config and the dynamic linker prefer /usr/local Abseil over
+# the older apt-installed /usr/lib/x86_64-linux-gnu copy.
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH}
+ENV LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH}
+
 # tomlplusplus from master — bypasses the gcc preprocessor bug in tagged 3.4.0
 # where `__has_attribute(__noinline__)` fails to expand (the meson wrap pinned
 # in NIXL pulls 3.4.0). v3.4.0 is still the latest tag; the fix lives only on
